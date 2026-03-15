@@ -1,383 +1,347 @@
+"""
+Jobs route - uses JSearch API (RapidAPI) for real job listings.
+Sign up FREE at: https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
+Free tier: 200 requests/month - enough for development.
+"""
 import requests
+import os
 from fastapi import APIRouter
+from typing import List
 
 router = APIRouter()
 
-SIMPLIFY_URL = "https://raw.githubusercontent.com/SimplifyJobs/Summer2025-Internships/dev/.github/scripts/listings.json"
+# ── API Config ────────────────────────────────────────────────────────────────
+# Get free key at https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
+JSEARCH_URL  = "https://jsearch.p.rapidapi.com/search"
 
-def fetch_listings():
+# ── ATS Scoring ───────────────────────────────────────────────────────────────
+SDE_KEYWORDS = [
+    "python", "java", "go", "golang", "typescript", "javascript", "c++", "sql",
+    "aws", "gcp", "azure", "docker", "kubernetes", "terraform", "ci/cd",
+    "microservices", "rest api", "fastapi", "flask", "spring boot",
+    "distributed systems", "kafka", "spark", "redis",
+    "postgresql", "mysql", "mongodb", "dynamodb",
+    "pytorch", "tensorflow", "machine learning", "llm", "rag",
+    "data structures", "algorithms", "system design", "agile",
+]
+
+DA_PENALTY_TITLES = [
+    "data analyst", "business analyst", "business intelligence", "bi analyst"
+]
+SDE_BOOST_TITLES = [
+    "software engineer", "sde", "backend", "full stack", "ml engineer",
+    "ai engineer", "platform engineer", "devops", "cloud engineer"
+]
+
+
+def compute_ats_score(title: str, description: str, resume_keywords: List[str]) -> int:
+    if not resume_keywords:
+        return 50
+    text = (title + " " + description).lower()
+    matched = sum(1 for kw in resume_keywords if kw in text)
+    base = int((matched / max(len(resume_keywords), 1)) * 100)
+    boost   = 15 if any(kw in title.lower() for kw in SDE_BOOST_TITLES) else 0
+    penalty = 40 if any(kw in title.lower() for kw in DA_PENALTY_TITLES) else 0
+    return max(0, min(100, base + boost - penalty))
+
+
+def extract_resume_keywords(resume_text: str) -> List[str]:
+    lower = resume_text.lower()
+    return [kw for kw in SDE_KEYWORDS if kw in lower]
+
+
+# ── JSearch API (Real jobs from LinkedIn + Indeed + Glassdoor) ────────────────
+def fetch_jsearch(query: str, location: str, page: int = 1) -> list:
+    """
+    Fetch real jobs using JSearch RapidAPI.
+    Returns jobs from LinkedIn, Indeed, Glassdoor with full descriptions.
+    """
+    if not RAPIDAPI_KEY:
+        return []
+
+    q = query if query else "software engineer intern"
+    if location:
+        q = f"{q} in {location}"
+
+    headers = {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": "jsearch.p.rapidapi.com"
+    }
+    params = {
+        "query": q,
+        "page": str(page),
+        "num_pages": "1",
+        "date_posted": "today",      # only last 24hrs
+        "employment_types": "INTERN" # internships only
+    }
+
     try:
-        response = requests.get(SIMPLIFY_URL, timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except Exception:
-        return get_seed_data()
+        resp = requests.get(JSEARCH_URL, headers=headers, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("data", [])
+    except Exception as e:
+        print(f"JSearch error: {e}")
+        return []
 
-def get_seed_data():
+
+def normalize_jsearch_job(job: dict) -> dict:
+    """Convert JSearch job format to our standard format."""
+    return {
+        "id": job.get("job_id", "")[:80],
+        "title": job.get("job_title", ""),
+        "company": job.get("employer_name", ""),
+        "locations": [f"{job.get('job_city','')}, {job.get('job_state','')}".strip(", ")],
+        "url": job.get("job_apply_link") or job.get("job_google_link", "#"),
+        "date_posted": job.get("job_posted_at_timestamp", 0),
+        "description": job.get("job_description", "No description available."),
+        "sponsorship": "Check posting",
+        "terms": [],
+        "source": f"jsearch:{job.get('job_publisher','')}"
+    }
+
+
+# ── Adzuna API (backup - free with key) ───────────────────────────────────────
+def fetch_adzuna(query: str, location: str) -> list:
+    """Fetch from Adzuna - free API, get key at developer.adzuna.com"""
+    app_id  = os.getenv("ADZUNA_APP_ID", "")
+    app_key = os.getenv("ADZUNA_APP_KEY", "")
+    if not app_id or not app_key:
+        return []
+
+    params = {
+        "app_id": app_id,
+        "app_key": app_key,
+        "results_per_page": 50,
+        "what": query or "software engineer intern",
+        "sort_by": "date",
+        "content-type": "application/json",
+    }
+    if location:
+        params["where"] = location
+
+    try:
+        resp = requests.get(
+            "https://api.adzuna.com/v1/api/jobs/us/search/1",
+            params=params, timeout=15
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        return [{
+            "id": f"{j.get('company',{}).get('display_name','')}-{j.get('title','')}".replace(" ","-").lower()[:80],
+            "title": j.get("title", ""),
+            "company": j.get("company", {}).get("display_name", ""),
+            "locations": [j.get("location", {}).get("display_name", "")],
+            "url": j.get("redirect_url", "#"),
+            "date_posted": 0,
+            "description": j.get("description", "No description available."),
+            "sponsorship": "Check posting",
+            "terms": [],
+            "source": "adzuna"
+        } for j in results]
+    except Exception as e:
+        print(f"Adzuna error: {e}")
+        return []
+
+
+# ── Simplify Jobs (GitHub, free, no key, but NO descriptions) ─────────────────
+def fetch_simplify(search: str, location: str) -> list:
+    """
+    Fetch from Simplify Jobs GitHub repo.
+    WARNING: These jobs have NO descriptions — only title/company/URL.
+    The UI will show a 'View Original Posting' link instead.
+    """
+    URLS = [
+        "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
+        "https://raw.githubusercontent.com/SimplifyJobs/Summer2025-Internships/dev/.github/scripts/listings.json",
+    ]
+    listings = []
+    for url in URLS:
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            listings = resp.json()
+            if listings:
+                break
+        except Exception:
+            continue
+
+    if not listings:
+        return []
+
+    results = []
+    for job in listings:
+        if not job.get("active", True):
+            continue
+        title   = job.get("title", "")
+        company = job.get("company_name", job.get("company", ""))
+        locs    = job.get("locations", [])
+
+        if search and search.lower() not in title.lower() and search.lower() not in company.lower():
+            continue
+        if location and location.lower() not in " ".join(locs).lower():
+            continue
+
+        results.append({
+            "id": f"{company}-{title}".replace(" ","-").lower()[:80],
+            "title": title,
+            "company": company,
+            "locations": locs,
+            "url": job.get("url", "#"),
+            "date_posted": job.get("date_posted", 0),
+            "description": "Click 'View Original Posting →' to see the full job description on the company's careers page.",
+            "sponsorship": job.get("sponsorship", "Unknown"),
+            "terms": job.get("terms", []),
+            "source": "simplify"
+        })
+    return results
+
+
+# ── High-quality seed data (always available, no API needed) ──────────────────
+def get_seed_data() -> list:
     return [
-        # ── ML / AI ──────────────────────────────────────────────────────────
         {
-            "company_name": "Google",
-            "title": "Software Engineering Intern – Machine Learning",
+            "id": "google-swe-intern-2026",
+            "title": "Software Engineering Intern, BS 2026",
+            "company": "Google",
             "locations": ["Mountain View, CA"],
-            "url": "https://careers.google.com",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Work on ML infrastructure and model training pipelines at scale. Python, TensorFlow, distributed systems experience preferred. Build tools that power Search, Ads, and YouTube recommendations."
+            "url": "https://careers.google.com/jobs/results/?category=ENGINEERING&employment_type=INTERN",
+            "date_posted": 1741000000,
+            "description": "Build real products used by billions. Work with experienced engineers on Python/Java/Go systems at massive scale. Strong data structures, algorithms, distributed systems, REST APIs, Docker/Kubernetes required.",
+            "sponsorship": "Does Sponsor", "terms": ["Summer 2026"], "source": "seed"
         },
         {
-            "company_name": "OpenAI",
-            "title": "Research Engineer Intern",
-            "locations": ["San Francisco, CA"],
-            "url": "https://openai.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Work on LLM training, RLHF, and evaluation infrastructure. Strong Python, PyTorch, and distributed training skills required. Help push the frontier of AI safety and capability research."
-        },
-        {
-            "company_name": "Microsoft",
-            "title": "AI/ML Engineering Intern",
+            "id": "microsoft-swe-intern-2026",
+            "title": "Software Engineer Intern",
+            "company": "Microsoft",
             "locations": ["Redmond, WA"],
-            "url": "https://careers.microsoft.com",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build and deploy ML models for Azure AI services. Experience with PyTorch, model optimization, ONNX, and cloud platforms required. Work alongside the Copilot team."
+            "url": "https://careers.microsoft.com/students/us/en/job/internship",
+            "date_posted": 1741000000,
+            "description": "Build Azure cloud microservices using Python, Java, C#, Go. REST APIs, Docker, Kubernetes, CI/CD, distributed systems experience required. Full feature ownership in agile teams.",
+            "sponsorship": "Does Sponsor", "terms": ["Summer 2026"], "source": "seed"
         },
         {
-            "company_name": "Netflix",
-            "title": "Machine Learning Intern",
-            "locations": ["Los Gatos, CA"],
-            "url": "https://jobs.netflix.com",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Improve recommendation systems using collaborative filtering, deep learning, and real-time ML pipelines. Python, Spark, and experimentation frameworks required."
-        },
-        {
-            "company_name": "Snap",
-            "title": "ML Research Intern – Computer Vision",
-            "locations": ["Santa Monica, CA"],
-            "url": "https://snap.com/jobs",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Research and develop computer vision models for AR features in Snapchat. Experience with CNNs, transformers, PyTorch, and real-time inference on mobile devices."
-        },
-        {
-            "company_name": "NVIDIA",
-            "title": "Deep Learning Engineer Intern",
-            "locations": ["Santa Clara, CA"],
-            "url": "https://nvidia.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Develop deep learning frameworks, GPU-accelerated training pipelines, and model optimization techniques. CUDA, TensorRT, PyTorch experience required."
-        },
-        {
-            "company_name": "Anthropic",
-            "title": "Research Engineer Intern – LLM Safety",
-            "locations": ["San Francisco, CA"],
-            "url": "https://anthropic.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Work on interpretability, alignment, and evaluation of large language models. Strong Python, PyTorch, and ML research background required."
-        },
-        # ── Data Science / Analytics ──────────────────────────────────────────
-        {
-            "company_name": "Meta",
-            "title": "Data Science Intern",
+            "id": "meta-swe-intern-2026",
+            "title": "Software Engineer Intern",
+            "company": "Meta",
             "locations": ["Menlo Park, CA"],
-            "url": "https://metacareers.com",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Analyze large-scale datasets to drive product decisions across Facebook, Instagram, and WhatsApp. SQL, Python, A/B testing, statistical modeling required."
+            "url": "https://www.metacareers.com/jobs/internships/",
+            "date_posted": 1741000000,
+            "description": "Large-scale distributed systems, backend infrastructure. Python, C++, Java required. Kafka, Spark, MySQL, Cassandra experience preferred. Strong system design fundamentals essential.",
+            "sponsorship": "Does Sponsor", "terms": ["Summer 2026"], "source": "seed"
         },
         {
-            "company_name": "Uber",
-            "title": "Data Science Intern – Marketplace",
+            "id": "amazon-sde-intern-2026",
+            "title": "SDE Intern (Summer 2026)",
+            "company": "Amazon",
+            "locations": ["Seattle, WA"],
+            "url": "https://www.amazon.jobs/en/jobs?category=software-development&job_type=Internship",
+            "date_posted": 1741000000,
+            "description": "Production code in Java, Python, Go. Microservices on AWS (EC2, Lambda, S3, DynamoDB). Docker, Kubernetes, CI/CD. Strong data structures, algorithms, system design required.",
+            "sponsorship": "Does Sponsor", "terms": ["Summer 2026"], "source": "seed"
+        },
+        {
+            "id": "openai-research-intern-2026",
+            "title": "Research Engineer Intern",
+            "company": "OpenAI",
             "locations": ["San Francisco, CA"],
-            "url": "https://uber.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Apply ML to pricing, matching, and demand forecasting for the Uber marketplace. Python, SQL, causal inference, and experimentation experience preferred."
+            "url": "https://openai.com/careers#internships",
+            "date_posted": 1741000000,
+            "description": "LLM training, RLHF, model evaluation in PyTorch. LoRA fine-tuning, RAG pipelines, distributed training (FSDP, DeepSpeed). Strong Python and ML research background required.",
+            "sponsorship": "Does Sponsor", "terms": ["Summer 2026"], "source": "seed"
         },
         {
-            "company_name": "Airbnb",
-            "title": "Data Analyst Intern",
-            "locations": ["San Francisco, CA"],
-            "url": "https://careers.airbnb.com",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Partner with product and growth teams to analyze user behavior, build dashboards, and run experiments. Strong SQL, Python, Tableau, and A/B testing skills."
-        },
-        {
-            "company_name": "Stripe",
-            "title": "Data Scientist Intern – Risk",
-            "locations": ["San Francisco, CA", "Remote"],
-            "url": "https://stripe.com/jobs",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build fraud detection and risk scoring models using transaction data. ML, SQL, Python, and knowledge of payments or fintech a plus."
-        },
-        {
-            "company_name": "LinkedIn",
-            "title": "Data Science Intern – Feed Ranking",
-            "locations": ["Sunnyvale, CA"],
-            "url": "https://linkedin.com/jobs",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Improve LinkedIn's feed and notification ranking algorithms. Experience with ML, SQL, Python, and large-scale experimentation platforms."
-        },
-        # ── Data Engineering ──────────────────────────────────────────────────
-        {
-            "company_name": "Airbnb",
-            "title": "Data Engineering Intern",
-            "locations": ["San Francisco, CA"],
-            "url": "https://careers.airbnb.com",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build scalable data pipelines using Spark, Airflow, and Presto. Design data models and ETL workflows to support analytics and ML teams."
-        },
-        {
-            "company_name": "Databricks",
-            "title": "Data Engineering Intern",
-            "locations": ["San Francisco, CA", "Remote"],
-            "url": "https://databricks.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build features for the Databricks Lakehouse platform. Apache Spark, Delta Lake, Python, and distributed systems knowledge required."
-        },
-        {
-            "company_name": "Snowflake",
-            "title": "Data Engineering Intern",
-            "locations": ["San Mateo, CA", "Remote"],
-            "url": "https://snowflake.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Design and build data infrastructure on the Snowflake cloud data platform. SQL, Python, dbt, and cloud experience preferred."
-        },
-        # ── Software Engineering ──────────────────────────────────────────────
-        {
-            "company_name": "Apple",
-            "title": "Software Engineer Intern",
-            "locations": ["Cupertino, CA"],
-            "url": "https://apple.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build software for macOS, iOS, or developer tools. Strong proficiency in Swift, Python, or C++. Passion for quality, performance, and user experience."
-        },
-        {
-            "company_name": "Amazon",
-            "title": "Software Development Engineer Intern",
-            "locations": ["Seattle, WA", "New York, NY"],
-            "url": "https://amazon.jobs",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Design and implement features for Amazon's services at scale. Java, Python, distributed systems, and AWS experience preferred."
-        },
-        {
-            "company_name": "Salesforce",
-            "title": "Software Engineer Intern",
-            "locations": ["San Francisco, CA", "Remote"],
-            "url": "https://salesforce.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build features for the Salesforce CRM platform and Einstein AI products. Java, JavaScript, Python, and Apex experience."
-        },
-        # ── Backend ───────────────────────────────────────────────────────────
-        {
-            "company_name": "Twilio",
+            "id": "stripe-backend-intern-2026",
             "title": "Backend Engineer Intern",
-            "locations": ["San Francisco, CA", "Remote"],
-            "url": "https://twilio.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build APIs and microservices for Twilio's communication platform. Node.js, Java, Go, and REST API design experience preferred."
-        },
-        {
-            "company_name": "DoorDash",
-            "title": "Backend Software Engineer Intern",
-            "locations": ["San Francisco, CA", "New York, NY"],
-            "url": "https://doordash.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build scalable backend systems for DoorDash's logistics and marketplace platform. Python, Java, Kotlin, microservices, and Kafka experience."
-        },
-        # ── Frontend / Full Stack ─────────────────────────────────────────────
-        {
-            "company_name": "Figma",
-            "title": "Frontend Engineer Intern",
+            "company": "Stripe",
             "locations": ["San Francisco, CA"],
-            "url": "https://figma.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build UI components and real-time collaboration features in Figma. React, TypeScript, WebAssembly, and WebGL experience preferred."
+            "url": "https://stripe.com/jobs/search?query=intern",
+            "date_posted": 1741000000,
+            "description": "Payment infrastructure in Ruby, Python, Go, Java. REST APIs, PostgreSQL, distributed systems, microservices, fault tolerance. Full ownership from design to CI/CD deployment.",
+            "sponsorship": "Does Sponsor", "terms": ["Summer 2026"], "source": "seed"
         },
         {
-            "company_name": "Vercel",
-            "title": "Full Stack Engineer Intern",
-            "locations": ["Remote"],
-            "url": "https://vercel.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Work on the Vercel platform and Next.js framework. React, TypeScript, Node.js, edge computing, and developer tooling experience."
+            "id": "databricks-data-intern-2026",
+            "title": "Software Engineer Intern - Data Platform",
+            "company": "Databricks",
+            "locations": ["San Francisco, CA"],
+            "url": "https://www.databricks.com/company/careers/open-positions",
+            "date_posted": 1741000000,
+            "description": "Spark, Delta Lake, distributed query engines in Scala/Python/Java. Kafka, cloud (AWS/Azure/GCP), large-scale data pipelines, SQL optimization. Distributed systems fundamentals required.",
+            "sponsorship": "Does Sponsor", "terms": ["Summer 2026"], "source": "seed"
         },
-        # ── GenAI ─────────────────────────────────────────────────────────────
         {
-            "company_name": "Cohere",
-            "title": "GenAI Engineer Intern",
+            "id": "cloudflare-swe-intern-2026",
+            "title": "Software Engineer Intern - Distributed Systems",
+            "company": "Cloudflare",
             "locations": ["San Francisco, CA", "Remote"],
-            "url": "https://cohere.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build production GenAI applications using Cohere's LLM APIs. RAG pipelines, LangChain, vector databases, prompt engineering, and Python required."
-        },
-        {
-            "company_name": "Hugging Face",
-            "title": "ML Engineer Intern – Generative AI",
-            "locations": ["New York, NY", "Remote"],
-            "url": "https://huggingface.co/jobs",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Contribute to open-source LLM tools, diffusion models, and the Transformers library. Python, PyTorch, and deep understanding of transformer architectures."
-        },
-        # ── NLP ───────────────────────────────────────────────────────────────
-        {
-            "company_name": "Apple",
-            "title": "NLP Engineer Intern – Siri",
-            "locations": ["Cupertino, CA"],
-            "url": "https://apple.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build NLP models for Siri's natural language understanding. Experience with transformer models, BERT, text classification, NER, and PyTorch."
-        },
-        {
-            "company_name": "Grammarly",
-            "title": "NLP Research Intern",
-            "locations": ["San Francisco, CA", "Remote"],
-            "url": "https://grammarly.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Research and develop NLP models for grammar correction, style suggestions, and tone detection. Python, transformers, and computational linguistics experience."
-        },
-        # ── Quantitative ─────────────────────────────────────────────────────
-        {
-            "company_name": "Jane Street",
-            "title": "Quantitative Research Intern",
-            "locations": ["New York, NY"],
-            "url": "https://janestreet.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Develop trading strategies and quantitative models. Strong math, statistics, probability, Python/OCaml, and financial markets knowledge."
-        },
-        {
-            "company_name": "Citadel",
-            "title": "Quantitative Analyst Intern",
-            "locations": ["Chicago, IL", "New York, NY"],
-            "url": "https://citadel.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Apply statistical modeling, ML, and data analysis to financial data. Python, R, statistics, econometrics, and finance experience preferred."
-        },
-        # ── Cloud / DevOps ────────────────────────────────────────────────────
-        {
-            "company_name": "AWS",
-            "title": "Cloud Engineer Intern",
-            "locations": ["Seattle, WA", "Austin, TX"],
-            "url": "https://amazon.jobs",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Build and operate cloud infrastructure on AWS. Terraform, Kubernetes, Docker, CI/CD, Python, and distributed systems experience required."
-        },
-        {
-            "company_name": "Cloudflare",
-            "title": "DevOps / Infrastructure Intern",
-            "locations": ["San Francisco, CA", "Austin, TX", "Remote"],
-            "url": "https://cloudflare.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Work on globally distributed systems serving millions of requests per second. Go, Rust, Kubernetes, networking, and systems programming experience."
-        },
-        # ── Research ──────────────────────────────────────────────────────────
-        {
-            "company_name": "DeepMind",
-            "title": "Research Scientist Intern",
-            "locations": ["New York, NY"],
-            "url": "https://deepmind.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Conduct fundamental AI research in areas including RL, planning, reasoning, and multimodal models. PhD-track or strong research background required."
-        },
-        {
-            "company_name": "IBM Research",
-            "title": "Research Engineer Intern – AI",
-            "locations": ["New York, NY", "Remote"],
-            "url": "https://ibm.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Research AI and ML topics including foundation models, enterprise AI, and trustworthy AI. Python, PyTorch, and research publication experience."
-        },
-        # ── Product Management ────────────────────────────────────────────────
-        {
-            "company_name": "Google",
-            "title": "Associate Product Manager Intern",
-            "locations": ["Mountain View, CA", "New York, NY"],
-            "url": "https://careers.google.com",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Define product strategy and roadmap for Google products. Strong analytical thinking, user empathy, SQL, and cross-functional collaboration skills."
-        },
-        {
-            "company_name": "Atlassian",
-            "title": "Product Manager Intern",
-            "locations": ["Austin, TX", "Remote"],
-            "url": "https://atlassian.com/careers",
-            "active": True, "date_posted": 1710000000,
-            "terms": ["Summer 2025"], "sponsorship": "Does Sponsor",
-            "description": "Drive product development for Jira and Confluence. Data-driven decision-making, user research, roadmapping, and Agile/Scrum experience."
+            "url": "https://www.cloudflare.com/careers/jobs/",
+            "date_posted": 1741000000,
+            "description": "Global distributed infrastructure in Go/Rust/Python. Consensus, replication, leader election, fault tolerance. Docker, Kubernetes, Terraform, AWS/GCP experience preferred.",
+            "sponsorship": "Does Sponsor", "terms": ["Summer 2026"], "source": "seed"
         },
     ]
 
 
+# ── Main endpoint ─────────────────────────────────────────────────────────────
 @router.get("/")
-def get_jobs(search: str = "", location: str = "", limit: int = 50):
-    listings = fetch_listings()
+def get_jobs(
+    search: str = "",
+    location: str = "",
+    limit: int = 50,
+    resume_text: str = "",
+    ats_threshold: int = 0,
+):
+    jobs_raw = []
+    data_source = "none"
 
-    results = []
-    for job in listings:
-        title       = job.get("title", "")
-        company     = job.get("company_name", job.get("company", ""))
-        locations   = job.get("locations", [])
-        description = job.get("description", "")
-        active      = job.get("active", True)
+    # Priority 1: JSearch (real LinkedIn/Indeed jobs with full descriptions)
+    if RAPIDAPI_KEY:
+        jobs_raw = fetch_jsearch(search, location)
+        if jobs_raw:
+            jobs_raw = [normalize_jsearch_job(j) for j in jobs_raw]
+            data_source = "jsearch"
 
-        if not active:
-            continue
+    # Priority 2: Adzuna (free with key, real descriptions)
+    if not jobs_raw:
+        jobs_raw = fetch_adzuna(search, location)
+        if jobs_raw:
+            data_source = "adzuna"
 
-        # Search filter — match against title, company, OR description
+    # Priority 3: Simplify Jobs (real companies, no descriptions)
+    if not jobs_raw:
+        jobs_raw = fetch_simplify(search, location)
+        if jobs_raw:
+            data_source = "simplify"
+
+    # Priority 4: Seed data (always works, good descriptions)
+    if not jobs_raw:
+        jobs_raw = get_seed_data()
+        data_source = "seed"
         if search:
-            s = search.lower()
-            haystack = (title + " " + company + " " + description).lower()
-            if s not in haystack:
-                continue
+            jobs_raw = [
+                j for j in jobs_raw
+                if search.lower() in j["title"].lower()
+                or search.lower() in j["company"].lower()
+            ]
 
-        # Location filter — strip state suffix for broader matching
-        if location and location.lower() not in ("any location (usa)", ""):
-            loc_str = " ".join(locations).lower()
-            # Try city-only match (e.g. "san francisco" matches "San Francisco, CA")
-            loc_key = location.lower().split(",")[0].strip()
-            if loc_key not in loc_str and "remote" not in loc_str:
-                continue
+    # ATS scoring
+    resume_keywords = extract_resume_keywords(resume_text) if resume_text else []
+    results = []
+    for job in jobs_raw:
+        score = compute_ats_score(job["title"], job["description"], resume_keywords)
+        if resume_keywords and ats_threshold > 0 and score < ats_threshold:
+            continue
+        matched = [kw for kw in resume_keywords
+                   if kw in (job["title"] + " " + job["description"]).lower()]
+        results.append({**job, "ats_score": score, "matched_keywords": matched})
 
-        # Include first location in ID to prevent duplicates for same role in multiple cities
-        loc_key    = (locations[0] if locations else "").replace(" ", "-").replace(",", "").lower()
-        results.append({
-            "id":          (company + "-" + title + "-" + loc_key).replace(" ", "-").lower()[:100],
-            "title":       title,
-            "company":     company,
-            "locations":   locations,
-            "url":         job.get("url", "#"),
-            "date_posted": job.get("date_posted", 0),
-            "sponsorship": job.get("sponsorship", ""),
-            "terms":       job.get("terms", []),
-            "description": description,
-        })
+    results.sort(key=lambda x: x["ats_score"], reverse=True)
 
-    return {"jobs": results[:limit], "total": len(results)}
+    return {
+        "jobs": results[:limit],
+        "total": len(results),
+        "source": data_source,
+        "has_descriptions": data_source != "simplify"
+    }
