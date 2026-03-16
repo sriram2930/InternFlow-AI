@@ -3,6 +3,8 @@ from typing import TypedDict, List, Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 import json
 import regex as re
+from dotenv import load_dotenv
+load_dotenv()
 
 # NVIDIA Nemotron via OpenAI-compatible API
 client = OpenAI(
